@@ -36,3 +36,35 @@ data/processed/*
 # OS files
 .DS_Store
 Thumbs.db
+
+# Vision test images
+data/vision_test/
+
+# Datasets
+data/raw/*
+data/processed/*
+
+# YOLO / ML model weights
+*.pt
+*.pth
+*.onnx
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
