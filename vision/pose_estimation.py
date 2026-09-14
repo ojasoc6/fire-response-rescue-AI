@@ -9,6 +9,18 @@ from typing import Any
 import cv2
 from ultralytics import YOLO
 
+# Cache for loaded pose models to avoid reloading per frame
+_POSE_MODEL_CACHE: dict[str, YOLO] = {}
+
+def _load_pose_model(model_name: str) -> YOLO:
+    """Load and cache a YOLO pose model.
+
+    Reuses the same model instance across calls to reduce overhead.
+    """
+    if model_name not in _POSE_MODEL_CACHE:
+        _POSE_MODEL_CACHE[model_name] = YOLO(model_name)
+    return _POSE_MODEL_CACHE[model_name]
+
 
 # COCO keypoint indices used by the Ultralytics pose model
 NOSE = 0
@@ -579,6 +591,129 @@ def _save_annotated_image(
 
     return output_path
 
+
+def estimate_pose_frame(
+    frame: Any,
+    model_name: str = DEFAULT_MODEL,
+    detection_confidence: float = 0.25,
+    keypoint_threshold: float = 0.25,
+    save_annotated: bool = False,
+    output_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Run pose estimation on an OpenCV ndarray (frame).
+
+    Mirrors ``estimate_pose`` but operates directly on an image array to avoid
+    disk I/O. Returns the same observation dict structure. ``save_annotated``
+    is currently unsupported for frames; provide ``output_path`` only when
+    ``save_annotated=True``.
+    """
+    if not hasattr(frame, "shape"):
+        raise TypeError("Frame must be an image array (e.g., NumPy ndarray).")
+    model = _load_pose_model(model_name)
+    results = model(frame, conf=detection_confidence, verbose=False)
+    if not results:
+        raise RuntimeError("The pose model returned no results.")
+    result = results[0]
+    observations: list[dict[str, Any]] = []
+    annotated = frame.copy() if save_annotated else None
+    if result.keypoints is None or result.boxes is None:
+        observations_output = {"pose_detected": False, "person_count": 0, "persons": []}
+        if save_annotated:
+            raise NotImplementedError("Annotated image saving not supported for frame input.")
+        return observations_output
+    keypoints_xy = result.keypoints.xy.cpu().tolist()
+    keypoints_conf = (
+        result.keypoints.conf.cpu().tolist()
+        if result.keypoints.conf is not None
+        else []
+    )
+    boxes_xyxy = result.boxes.xyxy.cpu().tolist()
+    box_conf = (
+        result.boxes.conf.cpu().tolist()
+        if result.boxes.conf is not None
+        else []
+    )
+    person_count = len(keypoints_xy)
+    for person_index in range(person_count):
+        person_keypoints = keypoints_xy[person_index]
+        person_keypoint_conf = (
+            keypoints_conf[person_index]
+            if person_index < len(keypoints_conf)
+            else [0.0] * len(person_keypoints)
+        )
+        bbox = (
+            tuple(boxes_xyxy[person_index])
+            if person_index < len(boxes_xyxy)
+            else (0.0, 0.0, 0.0, 0.0)
+        )
+        posture, posture_diagnostics = _classify_posture(
+            person_keypoints,
+            person_keypoint_conf,
+            bbox,
+            keypoint_threshold,
+        )
+        visible_keypoints = sum(conf >= keypoint_threshold for conf in person_keypoint_conf)
+        detection_conf = (
+            float(box_conf[person_index])
+            if person_index < len(box_conf)
+            else 0.0
+        )
+        person_observation = {
+            "person_index": person_index,
+            "person_detected": True,
+            "detection_confidence": round(detection_conf, 4),
+            "posture": posture,
+            "visible_keypoints": visible_keypoints,
+            "bounding_box": {
+                "x_min": round(float(bbox[0]), 2),
+                "y_min": round(float(bbox[1]), 2),
+                "x_max": round(float(bbox[2]), 2),
+                "y_max": round(float(bbox[3]), 2),
+            },
+            "keypoints": _serialize_keypoints(person_keypoints, person_keypoint_conf),
+            "posture_diagnostics": posture_diagnostics,
+        }
+        observations.append(person_observation)
+        if save_annotated:
+            x_min, y_min, x_max, y_max = map(int, bbox)
+            cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+            for idx, pt in enumerate(person_keypoints):
+                if idx >= len(person_keypoint_conf):
+                    continue
+                conf = person_keypoint_conf[idx]
+                if conf < keypoint_threshold:
+                    continue
+                cv2.circle(annotated, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
+            for first, second in SKELETON:
+                if (
+                    first >= len(person_keypoints)
+                    or second >= len(person_keypoints)
+                    or first >= len(person_keypoint_conf)
+                    or second >= len(person_keypoint_conf)
+                ):
+                    continue
+                if (
+                    person_keypoint_conf[first] < keypoint_threshold
+                    or person_keypoint_conf[second] < keypoint_threshold
+                ):
+                    continue
+                p1 = (int(person_keypoints[first][0]), int(person_keypoints[first][1]))
+                p2 = (int(person_keypoints[second][0]), int(person_keypoints[second][1]))
+                cv2.line(annotated, p1, p2, (255, 0, 0), 2)
+            label = f"{posture} ({detection_conf:.2f})"
+            label_y = max(y_min - 10, 25)
+            cv2.putText(annotated, label, (x_min, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+    observations_output = {
+        "pose_detected": len(observations) > 0,
+        "person_count": len(observations),
+        "persons": observations,
+    }
+    if save_annotated:
+        if output_path is None:
+            raise ValueError("output_path required when save_annotated=True for frames.")
+        final_output_path = _save_annotated_image(annotated, Path("frame_input"), output_path)
+        observations_output["annotated_image"] = str(final_output_path)
+    return observations_output
 
 def main() -> None:
     parser = argparse.ArgumentParser(

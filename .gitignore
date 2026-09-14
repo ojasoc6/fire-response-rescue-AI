@@ -68,3 +68,5 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+# Temporary development scripts
+scratch/

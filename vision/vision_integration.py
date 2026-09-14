@@ -100,6 +100,70 @@ class VisionIntegrator:
 
         return self._no_person_observation()
 
+    def analyze_frame(self, frame: object) -> VisionObservation:
+        """Run person detection and pose estimation on an OpenCV ndarray.
+
+        Mirrors :meth:`analyze_image` but operates directly on a frame array
+        to avoid per-frame disk I/O.  The returned observation has the same
+        schema used by the fusion engine.
+        """
+        from vision.pose_estimation import estimate_pose_frame
+
+        detector_observation: Mapping[str, object] = self._no_person_observation()
+        try:
+            detector_observation = self._person_detector.detect(frame)
+        except Exception as error:
+            detector_error = error
+        else:
+            detector_error = None
+
+        try:
+            pose_result = estimate_pose_frame(frame, save_annotated=False)
+        except Exception as error:
+            if detector_observation.get("person_detected", False):
+                return self._detector_only_observation(detector_observation)
+            message = "Pose estimation failed"
+            if detector_error is not None:
+                message += f" after person detection also failed: {detector_error}"
+            raise VisionIntegrationError(f"{message}: {error}") from error
+
+        pose_persons = pose_result.get("persons", [])
+        qualifying_pose_persons = self._qualifying_pose_persons(pose_persons)
+
+        if detector_observation.get("person_detected", False):
+            selected_box = detector_observation.get("bounding_box")
+            if not isinstance(selected_box, Mapping):
+                raise VisionIntegrationError("Detected person is missing a valid bounding box")
+
+            pose_person = self._select_matching_pose_person(selected_box, pose_persons)
+            posture = str(pose_person.get("posture", "UNKNOWN")) if pose_person else "UNKNOWN"
+            return {
+                "person_detected": True,
+                "person_count": int(detector_observation.get("person_count", 1)),
+                "confidence": float(detector_observation.get("confidence", 0.0)),
+                "bounding_box": dict(selected_box),
+                "posture": posture,
+                "possible_vulnerable_pose": posture == "LYING_CANDIDATE",
+                "detection_source": "person_detector+pose" if pose_person else "person_detector",
+            }
+
+        if qualifying_pose_persons:
+            pose_person = max(
+                qualifying_pose_persons,
+                key=lambda person: float(person.get("detection_confidence", 0.0)),
+            )
+            return {
+                "person_detected": True,
+                "person_count": max(1, int(pose_result.get("person_count", len(qualifying_pose_persons)))),
+                "confidence": float(pose_person["detection_confidence"]),
+                "bounding_box": dict(pose_person["bounding_box"]),
+                "posture": str(pose_person.get("posture", "UNKNOWN")),
+                "possible_vulnerable_pose": pose_person.get("posture") == "LYING_CANDIDATE",
+                "detection_source": "pose_fallback",
+            }
+
+        return self._no_person_observation()
+
     def _get_pose_estimator(self) -> Callable[..., Mapping[str, object]]:
         if self._pose_estimator is None:
             # Keep the normal sensor-only entry point independent of OpenCV and

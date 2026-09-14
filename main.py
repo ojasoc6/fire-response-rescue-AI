@@ -126,16 +126,69 @@ def parse_arguments() -> argparse.Namespace:
             "Without it, the demonstration remains sensor-only."
         ),
     )
+    parser.add_argument(
+        "--live-camera",
+        action="store_true",
+        help="Run the pipeline in live camera mode using DroidCam.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
-    """Run selected scenario demonstrations and report clean failures."""
+    """Run selected scenario demonstrations and report clean failures, or live camera mode."""
     arguments = parse_arguments()
     if _IMPORT_ERROR is not None:
         print(f"Pipeline startup error: required module unavailable: {_IMPORT_ERROR}", file=sys.stderr)
         return 1
 
+    # Live camera mode handling
+    if getattr(arguments, "live_camera", False):
+        import cv2
+        import torch
+        from pathlib import Path
+        from vision.live_camera import LiveCamera
+        from vision.overlay_utils import draw_overlay
+        from vision.fire_smoke_detection import FireSmokeDetector
+        from vision.vision_integration import VisionIntegrator
+        from collections import deque
+
+        cam = LiveCamera()
+        device_str = "GPU (CUDA)" if torch.cuda.is_available() else "CPU"
+        vision_integrator = VisionIntegrator()
+        fire_detector = FireSmokeDetector(model_path=Path("models/fire_smoke_yolov8n.pt"))
+        simulator = SensorSimulator(seed=42)
+        processor = FeatureProcessor()
+        temporal_extractor = TemporalFeatureExtractor()
+        fusion_engine = FusionEngine()
+
+        processed_history = deque(maxlen=5)
+
+        while True:
+            ret, frame = cam.read()
+            if not ret:
+                print("Failed to read frame from camera", file=sys.stderr)
+                break
+
+            vision_info = vision_integrator.analyze_frame(frame)
+            fire_info = fire_detector.detect_frame(frame)
+
+            sensor_reading = simulator.generate_reading("NORMAL")
+            processed = processor.process(sensor_reading)
+            processed_history.append(processed)
+            temporal_features = temporal_extractor.extract(list(processed_history))
+
+            assessment = fusion_engine.fuse(processed, temporal_features, {**vision_info, **fire_info})
+
+            draw_overlay(frame, vision_info, fire_info, assessment, cam.fps, cam.resolution, device_str)
+            cv2.imshow("FireSight Live", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        cam.release()
+        cv2.destroyAllWindows()
+        return 0
+
+    # Existing non‑live execution path
     selected_scenarios: List[str] = (
         [arguments.scenario] if arguments.scenario else list(SCENARIOS)
     )
