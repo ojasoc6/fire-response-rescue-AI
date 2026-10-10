@@ -15,6 +15,7 @@ _IMPORT_ERROR: Optional[Exception] = None
 try:
     from fusion.feature_processing import FeatureProcessor
     from fusion.fusion_engine import FusionEngine
+    from simulation.real_sensor_receiver import RealSensorReceiver
     from simulation.sensor_simulator import SensorSimulator
     from temporal.temporal_features import TemporalFeatureExtractor
     from vision.vision_integration import VisionIntegrator
@@ -131,6 +132,23 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Run the pipeline in live camera mode using DroidCam.",
     )
+    parser.add_argument(
+        "--real-sensors",
+        action="store_true",
+        help="Flag to toggle reading from physical ESP32 hardware instead of simulated telemetry.",
+    )
+    parser.add_argument(
+        "--esp-port",
+        type=str,
+        default="COM9",
+        help="Port string for the ESP32 connection (default: 'COM9').",
+    )
+    parser.add_argument(
+        "--esp-baud",
+        type=int,
+        default=115200,
+        help="Baudrate integer for the ESP32 connection (default: 115200).",
+    )
     return parser.parse_args()
 
 
@@ -150,6 +168,7 @@ def main() -> int:
         from vision.overlay_utils import draw_overlay
         from vision.fire_smoke_detection import FireSmokeDetector
         from vision.vision_integration import VisionIntegrator
+        from simulation.real_sensor_receiver import RealSensorReceiver
         from collections import deque
 
         cam = LiveCamera()
@@ -161,31 +180,73 @@ def main() -> int:
         temporal_extractor = TemporalFeatureExtractor()
         fusion_engine = FusionEngine()
 
+        receiver: Optional[RealSensorReceiver] = None
+        if getattr(arguments, "real_sensors", False):
+            receiver = RealSensorReceiver(port=arguments.esp_port, baudrate=arguments.esp_baud)
+            receiver.start()
+
         processed_history = deque(maxlen=5)
 
-        while True:
-            ret, frame = cam.read()
-            if not ret:
-                print("Failed to read frame from camera", file=sys.stderr)
-                break
+        try:
+            while True:
+                ret, frame = cam.read()
+                if not ret:
+                    print("Failed to read frame from camera", file=sys.stderr)
+                    break
 
-            vision_info = vision_integrator.analyze_frame(frame)
-            fire_info = fire_detector.detect_frame(frame)
+                vision_info = vision_integrator.analyze_frame(frame)
+                fire_info = fire_detector.detect_frame(frame)
 
-            sensor_reading = simulator.generate_reading("NORMAL")
-            processed = processor.process(sensor_reading)
-            processed_history.append(processed)
-            temporal_features = temporal_extractor.extract(list(processed_history))
+                sensor_data = None
+                if receiver is not None:
+                    sensor_data = receiver.get_readings()
+                    dist = float(sensor_data.get("front_cm", 100.0))
+                    if dist < 0:
+                        dist = 100.0
+                    raw_gas = float(sensor_data.get("gas_raw", 100.0))
+                    if bool(sensor_data.get("gas_alert", False)) and raw_gas < 500.0:
+                        raw_gas = 600.0
+                    flame_int = 85.0 if bool(sensor_data.get("flame_detected", False)) else 0.0
+                    mov = 0.1 if bool(sensor_data.get("tilt", False)) else 0.5
+                    sensor_reading = {
+                        "gas_level": raw_gas,
+                        "temperature": 25.0,
+                        "flame_intensity": flame_int,
+                        "distance": dist,
+                        "movement": mov,
+                    }
+                else:
+                    sensor_reading = simulator.generate_reading("NORMAL")
 
-            assessment = fusion_engine.fuse(processed, temporal_features, {**vision_info, **fire_info})
+                processed = processor.process(sensor_reading)
+                processed_history.append(processed)
+                temporal_features = temporal_extractor.extract(list(processed_history))
 
-            draw_overlay(frame, vision_info, fire_info, assessment, cam.fps, cam.resolution, device_str)
-            cv2.imshow("FireSight Live", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                assessment = fusion_engine.fuse(
+                    processed,
+                    temporal_features,
+                    {**vision_info, **fire_info, **(sensor_data or {})},
+                )
 
-        cam.release()
-        cv2.destroyAllWindows()
+                draw_overlay(
+                    frame,
+                    vision_info,
+                    fire_info,
+                    assessment,
+                    cam.fps,
+                    cam.resolution,
+                    device_str,
+                    sensor_data=sensor_data,
+                )
+                cv2.imshow("FireSight Live", frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord('q'), 27):
+                    break
+        finally:
+            if receiver is not None:
+                receiver.stop()
+            cam.release()
+            cv2.destroyAllWindows()
         return 0
 
     # Existing non‑live execution path
