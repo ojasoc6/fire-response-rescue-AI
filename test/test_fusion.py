@@ -144,45 +144,74 @@ class FusionEngineTests(unittest.TestCase):
         self.engine = FusionEngine()
         self.extractor = TemporalFeatureExtractor()
 
-    def test_normal_assessment_is_low_none_none(self) -> None:
+    def test_normal_assessment_is_low_none_low(self) -> None:
         history = stable_history()
         assessment = self.engine.fuse(history[-1], self.extractor.extract(history))
         self.assertEqual(assessment["hazard_level"], "LOW")
+        self.assertEqual(assessment["hazard_desc"], "CLEAR")
         self.assertEqual(assessment["victim_state"], "NONE")
-        self.assertEqual(assessment["rescue_priority"], "NONE")
+        self.assertEqual(assessment["priority"], "LOW")
+        self.assertEqual(assessment["rescue_priority"], "LOW")
 
     def test_fire_has_elevated_hazard_without_a_victim_claim(self) -> None:
         history = worsening_fire_history()
         assessment = self.engine.fuse(history[-1], self.extractor.extract(history))
-        self.assertIn(assessment["hazard_level"], {"HIGH", "CRITICAL"})
+        self.assertEqual(assessment["hazard_level"], "HIGH")
+        self.assertEqual(assessment["hazard_desc"], "ACTIVE_HAZARD_CONFIRMED")
         self.assertEqual(assessment["victim_state"], "NONE")
-        self.assertEqual(assessment["rescue_priority"], "NONE")
+        self.assertEqual(assessment["priority"], "LOW")
 
-    def test_person_with_vulnerable_evidence_without_hazard_is_potential(self) -> None:
-        history = process_history(
-            [
-                {"gas_level": 150, "temperature": 25, "flame_intensity": 1, "distance": 80, "movement": 0.08},
-                {"gas_level": 155, "temperature": 26, "flame_intensity": 1, "distance": 75, "movement": 0.05},
-            ]
-        )
-        assessment = self.engine.fuse(
-            history[-1],
-            self.extractor.extract(history),
-            {"person_detected": True, "confidence": 0.9, "possible_collapsed_pose": True},
-        )
+    def test_person_lying_down_is_critical_incapacitated(self) -> None:
+        history = stable_history()
+        vision = {"person_detected": True, "confidence": 0.9, "posture": "LYING_DOWN"}
+        assessment = self.engine.fuse(history[-1], self.extractor.extract(history), vision)
+        self.assertEqual(assessment["victim_state"], "CRITICAL_INCAPACITATED")
+        self.assertEqual(assessment["priority"], "CRITICAL")
+
+    def test_person_sitting_in_low_hazard_is_potential_moderate(self) -> None:
+        history = stable_history()
+        vision = {"person_detected": True, "confidence": 0.9, "posture": "SITTING"}
+        assessment = self.engine.fuse(history[-1], self.extractor.extract(history), vision)
         self.assertEqual(assessment["victim_state"], "POTENTIAL")
-        self.assertEqual(assessment["rescue_priority"], "LOW")
+        self.assertEqual(assessment["priority"], "MODERATE")
+
+    def test_person_sitting_in_high_hazard_is_at_risk_high(self) -> None:
+        history = worsening_fire_history()
+        vision = {"person_detected": True, "confidence": 0.9, "posture": "SITTING"}
+        assessment = self.engine.fuse(history[-1], self.extractor.extract(history), vision)
+        self.assertEqual(assessment["hazard_level"], "HIGH")
+        self.assertEqual(assessment["victim_state"], "AT_RISK")
+        self.assertEqual(assessment["priority"], "HIGH")
+
+    def test_person_standing_in_low_hazard_is_stable_mobile_low(self) -> None:
+        history = stable_history()
+        vision = {"person_detected": True, "confidence": 0.9, "posture": "STANDING"}
+        assessment = self.engine.fuse(history[-1], self.extractor.extract(history), vision)
+        self.assertEqual(assessment["victim_state"], "STABLE_MOBILE")
+        self.assertEqual(assessment["priority"], "LOW")
+
+    def test_person_standing_in_high_hazard_is_trapped_mobile_high(self) -> None:
+        history = worsening_fire_history()
+        vision = {"person_detected": True, "confidence": 0.9, "posture": "STANDING"}
+        assessment = self.engine.fuse(history[-1], self.extractor.extract(history), vision)
+        self.assertEqual(assessment["hazard_level"], "HIGH")
+        self.assertEqual(assessment["victim_state"], "TRAPPED_MOBILE")
+        self.assertEqual(assessment["priority"], "HIGH")
 
     def test_fire_person_and_vulnerable_evidence_is_critical(self) -> None:
         history = worsening_fire_history()
-        assessment = self.engine.fuse(
-            history[-1],
-            self.extractor.extract(history),
-            {"person_detected": True, "confidence": 0.9, "possible_collapsed_pose": True},
-        )
+        vision = {
+            "person_detected": True,
+            "confidence": 0.9,
+            "posture": "LYING_DOWN",
+            "fire_detected": True,
+            "fire_confidence": 0.85,
+        }
+        assessment = self.engine.fuse(history[-1], self.extractor.extract(history), vision)
         self.assertEqual(assessment["hazard_level"], "CRITICAL")
-        self.assertEqual(assessment["victim_state"], "CRITICAL")
-        self.assertEqual(assessment["rescue_priority"], "CRITICAL")
+        self.assertEqual(assessment["hazard_desc"], "STRUCTURAL_FIRE_CONFIRMED")
+        self.assertEqual(assessment["victim_state"], "CRITICAL_INCAPACITATED")
+        self.assertEqual(assessment["priority"], "CRITICAL")
 
     def test_low_movement_alone_never_claims_a_victim(self) -> None:
         history = process_history(
@@ -193,33 +222,7 @@ class FusionEngineTests(unittest.TestCase):
         )
         assessment = self.engine.fuse(history[-1], self.extractor.extract(history))
         self.assertEqual(assessment["victim_state"], "NONE")
-        self.assertEqual(assessment["rescue_priority"], "NONE")
-
-    def test_standardized_upright_vision_is_not_vulnerable_pose_evidence(self) -> None:
-        history = stable_history()
-        vision = {
-            "person_detected": True,
-            "person_count": 1,
-            "confidence": 0.9,
-            "bounding_box": {"x_min": 1, "y_min": 1, "x_max": 10, "y_max": 10},
-            "posture": "UPRIGHT",
-            "possible_vulnerable_pose": False,
-        }
-        assessment = self.engine.fuse(history[-1], self.extractor.extract(history), vision)
-        self.assertEqual(assessment["victim_state"], "POTENTIAL")
-
-    def test_standardized_lying_pose_is_supporting_not_diagnostic_evidence(self) -> None:
-        history = stable_history()
-        vision = {
-            "person_detected": True,
-            "person_count": 1,
-            "confidence": 0.9,
-            "bounding_box": {"x_min": 1, "y_min": 1, "x_max": 10, "y_max": 10},
-            "posture": "LYING_CANDIDATE",
-            "possible_vulnerable_pose": True,
-        }
-        assessment = self.engine.fuse(history[-1], self.extractor.extract(history), vision)
-        self.assertEqual(assessment["victim_state"], "POTENTIAL")
+        self.assertEqual(assessment["priority"], "LOW")
 
     def test_standardized_no_person_observation_creates_no_victim_claim(self) -> None:
         history = stable_history()
@@ -233,6 +236,113 @@ class FusionEngineTests(unittest.TestCase):
         }
         assessment = self.engine.fuse(history[-1], self.extractor.extract(history), vision)
         self.assertEqual(assessment["victim_state"], "NONE")
+        self.assertEqual(assessment["priority"], "LOW")
+
+    def test_threat_cross_verification_all_levels(self) -> None:
+        base_history = stable_history()
+        temporal = self.extractor.extract(base_history)
+
+        # Level 0 (CLEAR)
+        res0 = self.engine.fuse(
+            base_history[-1],
+            temporal,
+            {"fire_confidence": 0.1, "smoke_confidence": 0.2},
+        )
+        self.assertEqual(res0["hazard_level"], "LOW")
+        self.assertEqual(res0["hazard_desc"], "CLEAR")
+
+        # Level 1 (UNCONFIRMED_ALERT) - only Gas >= 300
+        gas_only = dict(base_history[-1], gas_level=350, flame_intensity=0)
+        res1_gas = self.engine.fuse(gas_only, temporal)
+        self.assertEqual(res1_gas["hazard_level"], "MODERATE")
+        self.assertEqual(res1_gas["hazard_desc"], "UNCONFIRMED_ALERT (SINGLE SENSOR)")
+
+        # Level 1 (UNCONFIRMED_ALERT) - only Smoke >= 0.60
+        res1_smoke = self.engine.fuse(
+            base_history[-1],
+            temporal,
+            {"smoke_confidence": 0.70},
+        )
+        self.assertEqual(res1_smoke["hazard_level"], "MODERATE")
+
+        # Level 2 (CONFIRMED_THREAT) - Flame + Gas
+        flame_gas = dict(base_history[-1], gas_level=400, flame_intensity=80)
+        res2 = self.engine.fuse(flame_gas, temporal)
+        self.assertEqual(res2["hazard_level"], "HIGH")
+        self.assertEqual(res2["hazard_desc"], "ACTIVE_HAZARD_CONFIRMED")
+
+        # Level 2 (CONFIRMED_THREAT) - Gas spike + Vision Smoke >= 0.60
+        res2_gas_smoke = self.engine.fuse(
+            gas_only,
+            temporal,
+            {"smoke_confidence": 0.65},
+        )
+        self.assertEqual(res2_gas_smoke["hazard_level"], "HIGH")
+
+        # Level 3 (EXTREME_DISASTER) - Vision Fire + IR Flame + Gas
+        res3 = self.engine.fuse(
+            flame_gas,
+            temporal,
+            {"fire_confidence": 0.85},
+        )
+        self.assertEqual(res3["hazard_level"], "CRITICAL")
+        self.assertEqual(res3["hazard_desc"], "STRUCTURAL_FIRE_CONFIRMED")
+
+    def test_navigation_advisories(self) -> None:
+        history = stable_history()
+        temporal = self.extractor.extract(history)
+
+        # front < 0 -> SENSOR_OFFLINE
+        res = self.engine.fuse(history[-1], temporal, {"front_cm": -1.0, "left_cm": 50, "right_cm": 50})
+        self.assertEqual(res["nav_advisory"], "SENSOR_OFFLINE")
+
+        # all -1.0 -> SENSOR_OFFLINE
+        res = self.engine.fuse(history[-1], temporal, {"front_cm": -1.0, "left_cm": -1.0, "right_cm": -1.0})
+        self.assertEqual(res["nav_advisory"], "SENSOR_OFFLINE")
+
+        # front < 20 and left < 20 and right < 20 -> TRAPPED_DEAD_END
+        res = self.engine.fuse(history[-1], temporal, {"front_cm": 15, "left_cm": 15, "right_cm": 15})
+        self.assertEqual(res["nav_advisory"], "TRAPPED_DEAD_END")
+
+        # front < 30, left >= right and left >= 30 -> DETOUR_LEFT
+        res = self.engine.fuse(history[-1], temporal, {"front_cm": 25, "left_cm": 40, "right_cm": 20})
+        self.assertEqual(res["nav_advisory"], "DETOUR_LEFT")
+
+        # front < 30, right > left and right >= 30 -> DETOUR_RIGHT
+        res = self.engine.fuse(history[-1], temporal, {"front_cm": 25, "left_cm": 20, "right_cm": 40})
+        self.assertEqual(res["nav_advisory"], "DETOUR_RIGHT")
+
+        # front < 30, both left and right < 30 -> OBSTACLE_AHEAD_REVERSE
+        res = self.engine.fuse(history[-1], temporal, {"front_cm": 25, "left_cm": 25, "right_cm": 25})
+        self.assertEqual(res["nav_advisory"], "OBSTACLE_AHEAD_REVERSE")
+
+        # front >= 30 -> PATH_CLEAR
+        res = self.engine.fuse(history[-1], temporal, {"front_cm": 50, "left_cm": 10, "right_cm": 10})
+        self.assertEqual(res["nav_advisory"], "PATH_CLEAR")
+
+    def test_robot_platform_safety(self) -> None:
+        history = stable_history()
+        temporal = self.extractor.extract(history)
+
+        # tilt True -> ROLLOVER_RISK (HALT)
+        res = self.engine.fuse(history[-1], temporal, {"tilt": True})
+        self.assertEqual(res["robot_status"], "ROLLOVER_RISK (HALT)")
+
+        # abs(acc_z) < 0.6 -> ROLLOVER_RISK (HALT)
+        res = self.engine.fuse(history[-1], temporal, {"acc_z": 0.4})
+        self.assertEqual(res["robot_status"], "ROLLOVER_RISK (HALT)")
+
+        # sqrt(acc_x^2 + acc_y^2) > 0.8 -> ROLLOVER_RISK (HALT)
+        res = self.engine.fuse(history[-1], temporal, {"acc_x": 0.7, "acc_y": 0.5})
+        self.assertEqual(res["robot_status"], "ROLLOVER_RISK (HALT)")
+
+        # sqrt(acc_x^2 + acc_y^2 + acc_z^2) > 2.0 -> IMPACT_DETECTED
+        res = self.engine.fuse(history[-1], temporal, {"acc_x": 0.1, "acc_y": 0.1, "acc_z": 2.2})
+        self.assertEqual(res["robot_status"], "IMPACT_DETECTED")
+
+        # Normal -> STABLE (LEVEL)
+        res = self.engine.fuse(history[-1], temporal, {"acc_x": 0.0, "acc_y": 0.0, "acc_z": 1.0, "tilt": False})
+        self.assertEqual(res["robot_status"], "STABLE (LEVEL)")
 
 
 class VisionIntegrationTests(unittest.TestCase):

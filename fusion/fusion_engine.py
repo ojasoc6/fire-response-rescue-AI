@@ -1,16 +1,19 @@
-"""Transparent rule-based fusion for the fire-rescue software prototype.
+"""Transparent multimodal cross-verification and triage fusion engine.
 
-This is deliberately a baseline, not a trained machine-learning model.  It
-combines processed environmental evidence, short-window temporal evidence,
-and optional vision observations into explainable rescue-assessment outputs.
+Implements 4 coordinated evaluation layers:
+1. Environmental Threat Cross-Verification (IR Flame, Gas, Vision Fire, Vision Smoke)
+2. Victim Triage & Priority (Posture + Environmental Hazard Level)
+3. Navigation Advisory (3x Ultrasonic Clearance)
+4. Robot Platform Safety (MPU-6050 IMU Acceleration & Tilt)
 """
 
 from __future__ import annotations
 
+import math
 import sys
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 
 FusionValue = Union[str, List[str]]
@@ -22,7 +25,7 @@ class FusionDataValidationError(ValueError):
 
 
 class FusionEngine:
-    """Combine processed sensor, temporal, and optional vision evidence."""
+    """Coordinate multi-sensor cross-verification, triage, navigation, and platform safety."""
 
     _SENSOR_FLAGS = ("high_gas", "high_temperature", "flame_detected", "low_movement")
     _TEMPORAL_FIELDS = (
@@ -39,31 +42,281 @@ class FusionEngine:
         temporal_features: Mapping[str, object],
         vision_info: Optional[Mapping[str, object]] = None,
     ) -> FusionResult:
-        """Return hazard, victim, and rescue-priority assessments.
+        """Return cross-verified threat, victim triage, navigation advisory, and platform safety.
 
-        ``vision_info`` is optional to keep the sensor pipeline independently
-        usable.  Supported visual observations are ``person_detected``,
-        ``confidence``, ``possible_vulnerable_pose``, and ``victim_signal``.
-        A stationary sensor reading alone never creates a victim assessment.
+        Coordinated layers:
+        A. Environmental Threat Cross-Verification
+        B. Victim Triage & Priority
+        C. Navigation Advisory (3x Ultrasonic Clearance)
+        D. Robot Platform Safety (MPU-6050 IMU)
         """
         sensor = self._validate_sensor_features(processed_features)
         temporal = self._validate_temporal_features(temporal_features)
         vision = self._normalize_vision(vision_info)
 
-        hazard_level, hazard_evidence = self._assess_hazard(sensor, temporal)
-        victim_state, victim_evidence = self._assess_victim(
-            sensor, hazard_level, vision
-        )
-        rescue_priority, priority_evidence = self._assess_priority(
-            hazard_level, victim_state, vision
-        )
+        # Layer A: Environmental Threat Cross-Verification
+        hazard_level, hazard_desc, confirming = self._assess_threat(processed_features, vision_info)
+
+        # Layer B: Victim Triage & Priority
+        victim_state, priority = self._assess_victim_triage(hazard_level, vision_info, vision)
+
+        # Layer C: Navigation Advisory
+        nav_advisory = self._assess_navigation(processed_features, vision_info)
+
+        # Layer D: Robot Platform Safety
+        robot_status = self._assess_robot_safety(vision_info)
+
+        decision_factors: List[str] = []
+        if confirming:
+            decision_factors.append(
+                f"Threat: {hazard_desc} ({len(confirming)} confirming modalities: {', '.join(confirming)})"
+            )
+        else:
+            decision_factors.append(f"Threat: {hazard_desc} (No active fire/smoke modalities tripped)")
+
+        if bool(temporal.get("environment_worsening")) or bool(temporal.get("flame_persistent")):
+            decision_factors.append("Environmental trend: persistent or worsening hazard conditions")
+
+        decision_factors.append(f"Victim triage: {victim_state} (Priority: {priority})")
+        decision_factors.append(f"Navigation advisory: {nav_advisory}")
+        decision_factors.append(f"Robot platform safety: {robot_status}")
 
         return {
             "hazard_level": hazard_level,
+            "hazard_desc": hazard_desc,
             "victim_state": victim_state,
-            "rescue_priority": rescue_priority,
-            "decision_factors": hazard_evidence + victim_evidence + priority_evidence,
+            "priority": priority,
+            "rescue_priority": priority,
+            "nav_advisory": nav_advisory,
+            "robot_status": robot_status,
+            "decision_factors": decision_factors,
         }
+
+    def _assess_threat(
+        self,
+        processed_features: Mapping[str, object],
+        vision_info: Optional[Mapping[str, object]],
+    ) -> Tuple[str, str, List[str]]:
+        """Evaluate environmental threat using 4 independent modalities:
+
+        - IR Flame sensor
+        - Gas/Smoke sensor (spike >= 300)
+        - Vision Fire detector (conf >= 0.50)
+        - Vision Smoke detector (conf >= 0.60)
+        """
+        confirming: List[str] = []
+
+        # 1. IR Flame
+        flame_detected_raw = False
+        if vision_info and bool(vision_info.get("flame_detected", False)):
+            flame_detected_raw = True
+        elif bool(processed_features.get("flame_detected", False)):
+            flame_detected_raw = True
+        elif float(processed_features.get("flame_intensity", 0.0)) >= 60.0:
+            flame_detected_raw = True
+
+        if flame_detected_raw:
+            confirming.append("IR Flame")
+
+        # 2. Gas Spike (Gas >= 300 or explicit alert)
+        gas_spike = False
+        if vision_info:
+            if float(vision_info.get("gas_raw", 0.0)) >= 300.0:
+                gas_spike = True
+            elif float(vision_info.get("gas_level", 0.0)) >= 300.0:
+                gas_spike = True
+            elif bool(vision_info.get("gas_alert", False)):
+                gas_spike = True
+
+        if not gas_spike:
+            if float(processed_features.get("gas_level", 0.0)) >= 300.0:
+                gas_spike = True
+            elif float(processed_features.get("gas_raw", 0.0)) >= 300.0:
+                gas_spike = True
+            elif bool(processed_features.get("high_gas", False)):
+                gas_spike = True
+            elif bool(processed_features.get("gas_alert", False)):
+                gas_spike = True
+
+        if gas_spike:
+            confirming.append("Gas Spike (>=300)")
+
+        # 3. Vision Fire (confidence >= 0.50)
+        vision_fire = False
+        if vision_info:
+            fire_conf = float(vision_info.get("fire_confidence", 0.0))
+            if fire_conf >= 0.50:
+                vision_fire = True
+            elif bool(vision_info.get("fire_detected", False)) and fire_conf == 0.0:
+                # If boolean is explicitly True without confidence breakdown, default to high confidence
+                vision_fire = True
+
+        if vision_fire:
+            confirming.append("Vision Fire (>=0.50)")
+
+        # 4. Vision Smoke (confidence >= 0.60)
+        vision_smoke = False
+        if vision_info:
+            smoke_conf = float(vision_info.get("smoke_confidence", 0.0))
+            if smoke_conf >= 0.60:
+                vision_smoke = True
+            elif bool(vision_info.get("smoke_detected", False)) and smoke_conf == 0.0:
+                vision_smoke = True
+
+        if vision_smoke:
+            confirming.append("Vision Smoke (>=0.60)")
+
+        count = len(confirming)
+        if count == 0:
+            return "LOW", "CLEAR", confirming
+        elif count == 1:
+            return "MODERATE", "UNCONFIRMED_ALERT (SINGLE SENSOR)", confirming
+        elif count == 2:
+            return "HIGH", "ACTIVE_HAZARD_CONFIRMED", confirming
+        else:
+            return "CRITICAL", "STRUCTURAL_FIRE_CONFIRMED", confirming
+
+    def _assess_victim_triage(
+        self,
+        hazard_level: str,
+        vision_info: Optional[Mapping[str, object]],
+        normalized_vision: Mapping[str, Union[bool, float]],
+    ) -> Tuple[str, str]:
+        """Triage victim state and rescue priority based on posture and environmental hazard.
+
+        Rules:
+        - If no person detected: victim_state: NONE, priority: LOW
+        - If person detected:
+            - Posture == LYING_DOWN: victim_state: CRITICAL_INCAPACITATED, priority: CRITICAL
+            - Posture == SITTING and Hazard in [HIGH, CRITICAL]: victim_state: AT_RISK, priority: HIGH
+            - Posture == SITTING and Hazard in [LOW, MODERATE]: victim_state: POTENTIAL, priority: MODERATE
+            - Posture == STANDING and Hazard in [HIGH, CRITICAL]: victim_state: TRAPPED_MOBILE, priority: HIGH
+            - Posture == STANDING and Hazard in [LOW, MODERATE]: victim_state: STABLE_MOBILE, priority: LOW
+        """
+        person_detected = bool(normalized_vision.get("person_detected", False) or normalized_vision.get("victim_signal", False))
+        if not person_detected or not vision_info:
+            return "NONE", "LOW"
+
+        posture_str = str(vision_info.get("posture", "")).strip().upper()
+        vulnerable = bool(
+            vision_info.get("possible_vulnerable_pose", False)
+            or vision_info.get("possible_collapsed_pose", False)
+            or normalized_vision.get("possible_vulnerable_pose", False)
+        )
+
+        is_lying = posture_str in ("LYING_DOWN", "LYING_CANDIDATE", "LYING") or vulnerable
+        is_sitting = posture_str in ("SITTING", "SEATED")
+        is_standing = posture_str in ("STANDING", "UPRIGHT")
+
+        if is_lying:
+            return "CRITICAL_INCAPACITATED", "CRITICAL"
+        elif is_sitting:
+            if hazard_level in ("HIGH", "CRITICAL"):
+                return "AT_RISK", "HIGH"
+            else:
+                return "POTENTIAL", "MODERATE"
+        elif is_standing:
+            if hazard_level in ("HIGH", "CRITICAL"):
+                return "TRAPPED_MOBILE", "HIGH"
+            else:
+                return "STABLE_MOBILE", "LOW"
+        else:
+            # Default / UNKNOWN posture
+            if hazard_level in ("HIGH", "CRITICAL"):
+                return "AT_RISK", "HIGH"
+            else:
+                return "POTENTIAL", "MODERATE"
+
+    def _assess_navigation(
+        self,
+        processed_features: Mapping[str, object],
+        vision_info: Optional[Mapping[str, object]],
+    ) -> str:
+        """Evaluate 3x ultrasonic distance clearance (front, left, right in cm).
+
+        Rules:
+        - If front < 0 or all -1.0: SENSOR_OFFLINE
+        - If front < 20 and left < 20 and right < 20: TRAPPED_DEAD_END
+        - If front < 30:
+            - If left >= right and left >= 30: DETOUR_LEFT
+            - Else if right > left and right >= 30: DETOUR_RIGHT
+            - Else: OBSTACLE_AHEAD_REVERSE
+        - If front >= 30: PATH_CLEAR
+        """
+        front = -1.0
+        left = -1.0
+        right = -1.0
+
+        if vision_info and "front_cm" in vision_info:
+            front = float(vision_info["front_cm"])
+        elif "front_cm" in processed_features:
+            front = float(processed_features["front_cm"])
+        elif "distance" in processed_features:
+            front = float(processed_features["distance"])
+
+        if vision_info and "left_cm" in vision_info:
+            left = float(vision_info["left_cm"])
+        elif "left_cm" in processed_features:
+            left = float(processed_features["left_cm"])
+
+        if vision_info and "right_cm" in vision_info:
+            right = float(vision_info["right_cm"])
+        elif "right_cm" in processed_features:
+            right = float(processed_features["right_cm"])
+
+        # Check offline
+        if front < 0 or (front == -1.0 and left == -1.0 and right == -1.0):
+            return "SENSOR_OFFLINE"
+
+        # Check trapped in dead end
+        if front < 20 and 0 <= left < 20 and 0 <= right < 20:
+            return "TRAPPED_DEAD_END"
+
+        # Check obstacle ahead
+        if front < 30:
+            if left >= right and left >= 30:
+                return "DETOUR_LEFT"
+            elif right > left and right >= 30:
+                return "DETOUR_RIGHT"
+            else:
+                return "OBSTACLE_AHEAD_REVERSE"
+
+        return "PATH_CLEAR"
+
+    def _assess_robot_safety(
+        self,
+        vision_info: Optional[Mapping[str, object]],
+    ) -> str:
+        """Evaluate MPU-6050 IMU acceleration and tilt status.
+
+        Rules:
+        - If tilt == True or abs(acc_z) < 0.6 or sqrt(acc_x^2 + acc_y^2) > 0.8:
+            ROLLOVER_RISK (HALT)
+        - Else if sqrt(acc_x^2 + acc_y^2 + acc_z^2) > 2.0:
+            IMPACT_DETECTED
+        - Else:
+            STABLE (LEVEL)
+        """
+        acc_x = 0.0
+        acc_y = 0.0
+        acc_z = 1.0
+        tilt = False
+
+        if vision_info:
+            acc_x = float(vision_info.get("acc_x", 0.0))
+            acc_y = float(vision_info.get("acc_y", 0.0))
+            acc_z = float(vision_info.get("acc_z", 1.0))
+            tilt = bool(vision_info.get("tilt", False))
+
+        xy_mag = math.sqrt(acc_x**2 + acc_y**2)
+        total_mag = math.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+
+        if tilt or abs(acc_z) < 0.6 or xy_mag > 0.8:
+            return "ROLLOVER_RISK (HALT)"
+        elif total_mag > 2.0:
+            return "IMPACT_DETECTED"
+        else:
+            return "STABLE (LEVEL)"
 
     def _validate_sensor_features(self, features: Mapping[str, object]) -> Dict[str, bool]:
         if not isinstance(features, Mapping):
@@ -123,8 +376,6 @@ class FusionEngine:
 
         # Low-confidence sightings are retained outside fusion until confirmed.
         person_detected = bool(vision_info.get("person_detected", False)) and confidence >= 0.5
-        # ``possible_collapsed_pose`` remains accepted for compatibility with
-        # earlier callers; new real vision observations use the clearer name.
         possible_vulnerable_pose = bool(
             vision_info.get(
                 "possible_vulnerable_pose",
@@ -138,104 +389,6 @@ class FusionEngine:
             "confidence": confidence,
         }
 
-    @staticmethod
-    def _assess_hazard(
-        sensor: Mapping[str, bool], temporal: Mapping[str, Union[bool, float]]
-    ) -> tuple[str, List[str]]:
-        current_hazards = sum(
-            (sensor["high_gas"], sensor["high_temperature"], sensor["flame_detected"])
-        )
-        evidence: List[str] = []
-        for field, label in (
-            ("high_gas", "high gas/smoke indication"),
-            ("high_temperature", "high temperature"),
-            ("flame_detected", "flame detected"),
-        ):
-            if sensor[field]:
-                evidence.append(label)
-
-        # One cue is medium; two or three simultaneous environmental cues are high.
-        if current_hazards == 0:
-            hazard_level = "LOW"
-        elif current_hazards == 1:
-            hazard_level = "MEDIUM"
-        else:
-            hazard_level = "HIGH"
-
-        persistent_environmental_cues = sum(
-            float(temporal[field]) >= 0.6
-            for field in (
-                "high_gas_persistence",
-                "high_temperature_persistence",
-                "flame_detected_persistence",
-            )
-        )
-        escalation = bool(temporal["environment_worsening"]) or bool(
-            temporal["flame_persistent"]
-        ) or persistent_environmental_cues >= 2
-        if escalation:
-            evidence.append("persistent or worsening environmental conditions")
-            hazard_level = {
-                "LOW": "MEDIUM",
-                "MEDIUM": "HIGH",
-                "HIGH": "CRITICAL",
-            }[hazard_level]
-        return hazard_level, evidence
-
-    @staticmethod
-    def _assess_victim(
-        sensor: Mapping[str, bool], hazard_level: str, vision: Mapping[str, Union[bool, float]]
-    ) -> tuple[str, List[str]]:
-        person_or_explicit_signal = bool(vision["person_detected"]) or bool(
-            vision["victim_signal"]
-        )
-        if not person_or_explicit_signal:
-            # Low movement remains supporting context, never a victim claim.
-            return "NONE", []
-
-        evidence = ["person or explicit victim signal observed"]
-        vulnerable_pose_or_stillness = bool(vision["possible_vulnerable_pose"]) or sensor[
-            "low_movement"
-        ]
-        if vulnerable_pose_or_stillness:
-            evidence.append("possible vulnerable visual posture or low movement")
-
-        if hazard_level == "CRITICAL" and vulnerable_pose_or_stillness:
-            return "CRITICAL", evidence
-        # A visual lying candidate or low movement is supporting context, not
-        # proof of a victim condition.  It elevates assessment only when an
-        # environmental hazard independently corroborates the concern.
-        if hazard_level in {"HIGH", "CRITICAL"} or (
-            hazard_level == "MEDIUM" and vulnerable_pose_or_stillness
-        ):
-            return "AT_RISK", evidence
-        return "POTENTIAL", evidence
-
-    @staticmethod
-    def _assess_priority(
-        hazard_level: str, victim_state: str, vision: Mapping[str, Union[bool, float]]
-    ) -> tuple[str, List[str]]:
-        if victim_state == "NONE":
-            return "NONE", []
-
-        if victim_state == "CRITICAL":
-            return "CRITICAL", ["critical victim evidence in a critical hazard"]
-        if victim_state == "AT_RISK":
-            if hazard_level == "CRITICAL":
-                return "CRITICAL", ["at-risk person in a critical hazard"]
-            if hazard_level in {"HIGH", "MEDIUM"}:
-                return "HIGH", ["at-risk person with environmental hazard"]
-            return "MEDIUM", ["at-risk person requires assessment"]
-
-        # A person alone has low priority; danger must be corroborated to rise.
-        if hazard_level == "CRITICAL":
-            return "HIGH", ["potential person in a critical hazard"]
-        if hazard_level == "HIGH":
-            return "MEDIUM", ["potential person with high environmental hazard"]
-        if hazard_level == "MEDIUM":
-            return "LOW", ["potential person with moderate environmental hazard"]
-        return "LOW", ["potential person observed"]
-
 
 def fuse_assessment(
     processed_features: Mapping[str, object],
@@ -247,7 +400,6 @@ def fuse_assessment(
 
 
 if __name__ == "__main__":
-    # Permit direct execution as well as ``python -m fusion.fusion_engine``.
     project_root = str(Path(__file__).resolve().parents[1])
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
@@ -278,7 +430,7 @@ if __name__ == "__main__":
                 {"gas_level": 155, "temperature": 26, "flame_intensity": 1, "distance": 75, "movement": 0.06},
                 {"gas_level": 150, "temperature": 25, "flame_intensity": 1, "distance": 70, "movement": 0.05},
             ],
-            "vision": {"person_detected": True, "confidence": 0.90, "possible_collapsed_pose": True},
+            "vision": {"person_detected": True, "confidence": 0.90, "posture": "LYING_DOWN"},
         },
         "FIRE_WITH_VICTIM": {
             "history": [
@@ -286,7 +438,7 @@ if __name__ == "__main__":
                 {"gas_level": 670, "temperature": 68, "flame_intensity": 85, "distance": 65, "movement": 0.06},
                 {"gas_level": 850, "temperature": 90, "flame_intensity": 95, "distance": 55, "movement": 0.03},
             ],
-            "vision": {"person_detected": True, "confidence": 0.95, "possible_collapsed_pose": True},
+            "vision": {"person_detected": True, "confidence": 0.95, "posture": "LYING_DOWN", "fire_detected": True, "fire_confidence": 0.90},
         },
     }
 
